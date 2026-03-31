@@ -1,0 +1,450 @@
+<?php
+require_once '../includes/auth.php';
+require_login();
+require_once '../config/db.php';
+require_once '../includes/helpers.php';
+
+$pageTitle = 'Generate ESG Report';
+
+// Try to find TCPDF
+$tcpdfPaths = [
+    __DIR__ . '/../vendor/autoload.php',
+    'g:/xamp/phpMyAdmin/vendor/autoload.php',
+    'g:/xamp/htdocs/tcpdf/tcpdf.php',
+];
+$tcpdfAvailable = false;
+foreach ($tcpdfPaths as $path) {
+    if (file_exists($path)) {
+        require_once $path;
+        $tcpdfAvailable = class_exists('TCPDF');
+        if ($tcpdfAvailable) break;
+    }
+}
+
+// Also try TCPDF standalone
+if (!$tcpdfAvailable) {
+    $standalonePaths = [
+        'g:/xamp/phpMyAdmin/vendor/tecnickcom/tcpdf/tcpdf.php',
+    ];
+    foreach ($standalonePaths as $path) {
+        if (file_exists($path)) {
+            require_once $path;
+            $tcpdfAvailable = class_exists('TCPDF');
+            if ($tcpdfAvailable) break;
+        }
+    }
+}
+
+define('PDF_FONT_FAMILY', 'helvetica');
+define('PDF_FONT_BODY',   12);
+define('PDF_FONT_H1',     18);
+define('PDF_FONT_H2',     14);
+define('PDF_FONT_SMALL',  10);
+
+$cid     = company_id();
+$period  = sanitize($_POST['period'] ?? $_GET['period'] ?? '');
+$action  = $_POST['action'] ?? $_GET['action'] ?? 'form';
+
+// Fetch company
+$stmt = $pdo->prepare('SELECT * FROM companies WHERE id = :id AND deleted_at IS NULL');
+$stmt->execute([':id' => $cid]);
+$company = $stmt->fetch();
+
+// Fetch emissions
+$stmt = $pdo->prepare('SELECT scope, ROUND(SUM(tco2e_calculated), 4) AS total FROM emission_records WHERE company_id = :id GROUP BY scope');
+$stmt->execute([':id' => $cid]);
+$emissions = [];
+foreach ($stmt->fetchAll() as $r) {
+    $emissions[$r['scope']] = $r['total'];
+}
+
+function fetchReport(PDO $db, string $table, string $cid, string $period) {
+    $s = $db->prepare("SELECT * FROM {$table} WHERE company_id = :c AND reporting_period = :p LIMIT 1");
+    $s->execute([':c' => $cid, ':p' => $period]);
+    return $s->fetch();
+}
+
+// Generate PDF if requested
+if ($action === 'generate' && $period !== '') {
+    if (!$tcpdfAvailable) {
+        // Redirect back with error
+        header('Location: /esg-report-test/report/generate.php?error=tcpdf_missing');
+        exit;
+    }
+
+    $env       = fetchReport($pdo, 'environmental_topics', $cid, $period);
+    $social    = fetchReport($pdo, 'social_topics', $cid, $period);
+    $gov       = fetchReport($pdo, 's_governance', $cid, $period);
+    $tax       = fetchReport($pdo, 'eu_taxonomy', $cid, $period);
+    $assurance = fetchReport($pdo, 'assurance', $cid, $period);
+
+    // Try ESRS2 - table may not exist yet
+    $esrs2 = null;
+    try {
+        $esrs2 = fetchReport($pdo, 'esrs2_general_disclosures', $cid, $period);
+    } catch (PDOException $e) {
+        // Table doesn't exist yet — skip
+    }
+
+    // Init TCPDF
+    $pdf = new TCPDF('P', 'mm', 'A4', true, 'UTF-8', false);
+    $pdf->SetCreator('ESG Reporting Platform');
+    $pdf->SetAuthor($company['name'] ?? 'ESG Platform');
+    $pdf->SetTitle('ESG Report - ' . $period);
+    $pdf->SetSubject('Environmental, Social and Governance Report');
+    $pdf->setPrintHeader(false);
+    $pdf->setPrintFooter(false);
+    $pdf->SetMargins(20, 20, 20);
+    $pdf->SetAutoPageBreak(true, 20);
+    $pdf->AddPage();
+
+    // ========== COVER PAGE ==========
+    $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H1);
+    $pdf->Ln(20);
+    $pdf->SetFillColor(16, 185, 129);  // emerald-500
+    $pdf->SetTextColor(255, 255, 255);
+    $pdf->Cell(0, 15, 'ESG SUSTAINABILITY REPORT', 0, 1, 'C', true);
+    $pdf->Ln(5);
+
+    $pdf->SetTextColor(0, 0, 0);
+    $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+    $pdf->Cell(0, 10, $company['name'] ?? '', 0, 1, 'C');
+    $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+    $pdf->Cell(0, 8, 'Reporting Period: ' . $period, 0, 1, 'C');
+    $pdf->Cell(0, 8, 'Generated: ' . date('d F Y'), 0, 1, 'C');
+    $pdf->Ln(10);
+
+    // ========== SECTION 1: COMPANY PROFILE ==========
+    $pdf->SetFillColor(240, 253, 244); // green-50
+    $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+    $pdf->Cell(0, 10, '1. Company Profile', 0, 1, 'L', true);
+    $pdf->Ln(2);
+    $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+    $pdf->Cell(0, 7, 'Company Name: ' . ($company['name'] ?? 'N/A'), 0, 1);
+    $pdf->Cell(0, 7, 'Industry: ' . ($company['industry'] ?? 'N/A'), 0, 1);
+    $pdf->Cell(0, 7, 'Country of Registration: ' . ($company['country_of_registration'] ?? 'N/A'), 0, 1);
+    if (!empty($company['registration_number'])) {
+        $pdf->Cell(0, 7, 'Registration Number: ' . $company['registration_number'], 0, 1);
+    }
+    if (!empty($company['website'])) {
+        $pdf->Cell(0, 7, 'Website: ' . $company['website'], 0, 1);
+    }
+    $pdf->Ln(5);
+
+    // ========== SECTION 2: GHG EMISSIONS ==========
+    $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+    $pdf->Cell(0, 10, '2. GHG Emissions Summary', 0, 1, 'L', true);
+    $pdf->Ln(2);
+    $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+    $scope1 = (float)($emissions['Scope 1'] ?? 0);
+    $scope2 = (float)($emissions['Scope 2 Location-Based'] ?? 0) + (float)($emissions['Scope 2 Market-Based'] ?? 0);
+    $total  = $scope1 + $scope2;
+    $pdf->Cell(0, 7, 'Scope 1 (Direct Emissions): ' . number_format($scope1, 4) . ' tCO2e', 0, 1);
+    $pdf->Cell(0, 7, 'Scope 2 (Location-Based): ' . number_format($scope2, 4) . ' tCO2e', 0, 1);
+    $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+    $pdf->Cell(0, 7, 'Total Emissions (Scope 1+2): ' . number_format($total, 4) . ' tCO2e', 0, 1);
+    $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+    $pdf->Ln(5);
+
+    // ========== SECTION 3: ESRS 2 ==========
+    if ($esrs2) {
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->Cell(0, 10, '3. ESRS 2 - General Disclosures', 0, 1, 'L', true);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        if (!empty($esrs2['consolidation_scope'])) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Consolidation Scope:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $esrs2['consolidation_scope'], 0, 'L');
+        }
+        if (!empty($esrs2['board_role_in_sustainability'])) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Board Role in Sustainability:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $esrs2['board_role_in_sustainability'], 0, 'L');
+        }
+        if ($esrs2['esg_integration_in_remuneration'] !== null) {
+            $pdf->Cell(0, 7, 'ESG Integration in Remuneration: ' . $esrs2['esg_integration_in_remuneration'] . '%', 0, 1);
+        }
+        $pdf->Ln(5);
+    }
+
+    // ========== SECTION 4: ENVIRONMENTAL ==========
+    if ($env) {
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->Cell(0, 10, '4. Environmental Topics (ESRS E1-E5)', 0, 1, 'L', true);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+
+        if ($env['e1_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'E1 - Climate Change:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            if (!empty($env['e1_climate_policy'])) {
+                $pdf->MultiCell(0, 7, 'Climate Policy: ' . $env['e1_climate_policy'], 0, 'L');
+            }
+            if (!empty($env['e1_reduction_target'])) {
+                $pdf->Cell(0, 7, 'Reduction Target: ' . $env['e1_reduction_target'], 0, 1);
+            }
+        }
+        if ($env['e2_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'E2 - Pollution:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'NOx: ' . ($env['e2_nox_t_per_year'] ?? 'N/A') . ' t/yr | SOx: ' . ($env['e2_sox_t_per_year'] ?? 'N/A') . ' t/yr', 0, 1);
+        }
+        if ($env['e3_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'E3 - Water:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Water Withdrawal: ' . ($env['e3_water_withdrawal_m3'] ?? 'N/A') . ' m³ | Recycling Rate: ' . ($env['e3_water_recycling_rate_pct'] ?? 'N/A') . '%', 0, 1);
+        }
+        if ($env['e4_material'] && !empty($env['e4_protected_areas_impact'])) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'E4 - Biodiversity:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $env['e4_protected_areas_impact'], 0, 'L');
+        }
+        if ($env['e5_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'E5 - Circular Economy:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Recycling Rate: ' . ($env['e5_recycling_rate_pct'] ?? 'N/A') . '% | Recycled Inputs: ' . ($env['e5_recycled_input_materials_pct'] ?? 'N/A') . '%', 0, 1);
+        }
+        $pdf->Ln(5);
+    }
+
+    // ========== SECTION 5: SOCIAL ==========
+    if ($social) {
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->Cell(0, 10, '5. Social Topics (ESRS S1-S4)', 0, 1, 'L', true);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+
+        if ($social['s1_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'S1 - Own Workforce:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Avg Training Hours/Employee: ' . ($social['s1_training_hours_per_employee'] ?? 'N/A'), 0, 1);
+            if (!empty($social['s1_health_and_safety'])) {
+                $pdf->MultiCell(0, 7, 'H&S: ' . $social['s1_health_and_safety'], 0, 'L');
+            }
+        }
+        if ($social['s2_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'S2 - Value Chain:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Suppliers Audited: ' . ($social['s2_pct_suppliers_audited'] ?? 'N/A') . '%', 0, 1);
+        }
+        if ($social['s3_material'] && !empty($social['s3_community_engagement'])) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'S3 - Communities:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $social['s3_community_engagement'], 0, 'L');
+        }
+        if ($social['s4_material']) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'S4 - Consumers:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Product Safety Incidents: ' . ($social['s4_product_safety_incidents'] ?? 'N/A'), 0, 1);
+        }
+        $pdf->Ln(5);
+    }
+
+    // ========== SECTION 6: GOVERNANCE ==========
+    if ($gov) {
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->Cell(0, 10, '6. Governance (ESRS G1)', 0, 1, 'L', true);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        $pdf->Cell(0, 7, 'Board Gender Diversity: ' . ($gov['g1_gender_diversity_pct'] ?? 'N/A') . '%', 0, 1);
+        if (!empty($gov['g1_esg_oversight'])) {
+            $pdf->MultiCell(0, 7, 'ESG Oversight: ' . $gov['g1_esg_oversight'], 0, 'L');
+        }
+        if (!empty($gov['g1_anti_corruption_policies'])) {
+            $pdf->Cell(0, 7, 'Anti-Corruption Policies: ' . $gov['g1_anti_corruption_policies'], 0, 1);
+        }
+        if (!empty($gov['g1_board_composition_independence'])) {
+            $pdf->MultiCell(0, 7, 'Board Composition: ' . $gov['g1_board_composition_independence'], 0, 'L');
+        }
+        $pdf->Ln(5);
+    }
+
+    // ========== SECTION 7: EU TAXONOMY ==========
+    if ($tax) {
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->Cell(0, 10, '7. EU Taxonomy Alignment', 0, 1, 'L', true);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        $pdf->Cell(0, 7, 'Eligible Revenue: ' . ($tax['taxonomy_eligible_revenue_pct'] ?? 'N/A') . '%  |  Aligned Revenue: ' . ($tax['taxonomy_aligned_revenue_pct'] ?? 'N/A') . '%', 0, 1);
+        $pdf->Cell(0, 7, 'Eligible CapEx: ' . ($tax['taxonomy_eligible_capex_pct'] ?? 'N/A') . '%  |  Aligned CapEx: ' . ($tax['taxonomy_aligned_capex_pct'] ?? 'N/A') . '%', 0, 1);
+        $pdf->Cell(0, 7, 'Aligned OpEx: ' . ($tax['taxonomy_aligned_opex_pct'] ?? 'N/A') . '%', 0, 1);
+        $pdf->Cell(0, 7, 'DNSH Status: ' . ($tax['dnsh_status'] ?? 'N/A'), 0, 1);
+        $pdf->Cell(0, 7, 'Social Safeguards: ' . ($tax['social_safeguards_status'] ?? 'N/A'), 0, 1);
+        $pdf->Ln(5);
+    }
+
+    // ========== SECTION 8: ASSURANCE ==========
+    if ($assurance) {
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->Cell(0, 10, '8. Assurance & Audit', 0, 1, 'L', true);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        $pdf->Cell(0, 7, 'Provider: ' . ($assurance['provider'] ?? 'N/A'), 0, 1);
+        $pdf->Cell(0, 7, 'Level: ' . ucfirst($assurance['level'] ?? 'N/A') . ' Assurance', 0, 1);
+        $pdf->Cell(0, 7, 'Standard: ' . ($assurance['standard'] ?? 'N/A'), 0, 1);
+        if (!empty($assurance['report_date'])) {
+            $pdf->Cell(0, 7, 'Report Date: ' . date('d F Y', strtotime($assurance['report_date'])), 0, 1);
+        }
+        if (!empty($assurance['conclusion'])) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Conclusion:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $assurance['conclusion'], 0, 'L');
+        }
+        $pdf->Ln(5);
+    }
+
+    // ========== FOOTER ==========
+    $pdf->SetFont(PDF_FONT_FAMILY, 'I', PDF_FONT_SMALL);
+    $pdf->Cell(0, 7, 'This report was generated by the ESG Reporting Platform on ' . date('d F Y H:i') . ' UTC', 0, 1, 'C');
+    $pdf->Cell(0, 7, 'Reporting Period: ' . $period . ' | Company ID: ' . $cid, 0, 1, 'C');
+
+    $filename = 'ESG_Report_' . preg_replace('/[^A-Za-z0-9_-]/', '_', $company['name'] ?? 'Company') . '_' . $period . '.pdf';
+    $pdf->Output($filename, 'D');
+    exit;
+}
+
+// Show the form page
+require_once '../includes/header.php';
+
+// Get available periods from data
+$stmt = $pdo->prepare('
+    SELECT DISTINCT DATE_FORMAT(date_calculated, \'%Y-%m\') AS period
+    FROM emission_records
+    WHERE company_id = :cid
+    ORDER BY period DESC
+');
+$stmt->execute([':cid' => $cid]);
+$availablePeriods = $stmt->fetchAll(PDO::FETCH_COLUMN);
+?>
+
+<div class="space-y-6 max-w-2xl">
+    <div>
+        <h2 class="text-2xl font-bold text-gray-900">Generate ESG Report</h2>
+        <p class="text-gray-500 text-base mt-1">Download a comprehensive PDF ESG report for any reporting period</p>
+    </div>
+
+    <?php if (isset($_GET['error']) && $_GET['error'] === 'tcpdf_missing'): ?>
+    <div class="bg-red-50 border border-red-200 rounded-lg p-4">
+        <div class="flex items-start space-x-3">
+            <svg class="w-5 h-5 text-red-500 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            <div>
+                <p class="text-sm font-semibold text-red-800">TCPDF Library Not Found</p>
+                <p class="text-sm text-red-700 mt-1">TCPDF is required to generate PDF reports. Please run <code class="bg-red-100 px-1 rounded">composer require tecnickcom/tcpdf</code> in the project root, or install TCPDF manually.</p>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <?php if (!$tcpdfAvailable): ?>
+    <div class="bg-amber-50 border border-amber-200 rounded-lg p-4">
+        <div class="flex items-start space-x-3">
+            <svg class="w-5 h-5 text-amber-500 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+            <div>
+                <p class="text-sm font-semibold text-amber-800">TCPDF Not Available</p>
+                <p class="text-sm text-amber-700 mt-1">
+                    PDF generation requires TCPDF. Install it via Composer:
+                    <code class="bg-amber-100 px-1.5 py-0.5 rounded font-mono text-xs">composer require tecnickcom/tcpdf</code>
+                </p>
+                <p class="text-sm text-amber-700 mt-1">Run this command in: <code class="bg-amber-100 px-1.5 py-0.5 rounded font-mono text-xs">g:\xamp\htdocs\esg-report-test\</code></p>
+            </div>
+        </div>
+    </div>
+    <?php else: ?>
+    <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-4 flex items-center space-x-2">
+        <svg class="w-5 h-5 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+        <p class="text-sm text-emerald-700 font-medium">TCPDF is available. PDF generation is ready.</p>
+    </div>
+    <?php endif; ?>
+
+    <!-- Report Configuration -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+        <div class="px-6 py-4 border-b border-gray-100 bg-gray-50">
+            <h3 class="text-base font-semibold text-gray-800">Report Configuration</h3>
+        </div>
+        <div class="p-6">
+            <form method="POST" class="space-y-5">
+                <input type="hidden" name="action" value="generate">
+
+                <!-- Reporting Period -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Reporting Period <span class="text-red-500">*</span></label>
+                    <input type="month" name="period"
+                           value="<?= htmlspecialchars($period ?: date('Y-m'), ENT_QUOTES, 'UTF-8') ?>"
+                           class="px-4 py-2.5 border border-gray-300 rounded-lg text-base focus:ring-2 focus:ring-emerald-500 outline-none"
+                           required>
+                    <?php if (!empty($availablePeriods)): ?>
+                    <p class="text-xs text-gray-400 mt-1">Periods with emission data: <?= implode(', ', array_map('htmlspecialchars', array_slice($availablePeriods, 0, 6))) ?></p>
+                    <?php endif; ?>
+                </div>
+
+                <!-- Report Contents Summary -->
+                <div class="bg-gray-50 rounded-lg p-4 border border-gray-100">
+                    <p class="text-sm font-medium text-gray-700 mb-2">Report will include:</p>
+                    <ul class="text-sm text-gray-600 space-y-1">
+                        <li class="flex items-center space-x-2"><svg class="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span>Company profile</span></li>
+                        <li class="flex items-center space-x-2"><svg class="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span>GHG emissions summary (all recorded data)</span></li>
+                        <li class="flex items-center space-x-2"><svg class="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span>ESRS 2 general disclosures</span></li>
+                        <li class="flex items-center space-x-2"><svg class="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span>Environmental (E1–E5), Social (S1–S4), Governance (G1)</span></li>
+                        <li class="flex items-center space-x-2"><svg class="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span>EU Taxonomy alignment</span></li>
+                        <li class="flex items-center space-x-2"><svg class="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span>Assurance & audit information</span></li>
+                    </ul>
+                    <p class="text-xs text-gray-400 mt-3">Sections without data for the selected period will be omitted automatically.</p>
+                </div>
+
+                <button type="submit" <?= !$tcpdfAvailable ? 'disabled' : '' ?>
+                        class="<?= $tcpdfAvailable ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-gray-400 cursor-not-allowed' ?> text-white font-semibold py-3 px-8 rounded-lg text-base transition flex items-center space-x-2">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                    </svg>
+                    <span>Download PDF Report</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Emissions Summary for selected company -->
+    <?php if (!empty($emissions)): ?>
+    <div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+        <div class="px-6 py-4 border-b border-gray-100 bg-gray-50">
+            <h3 class="text-base font-semibold text-gray-800">Current Emissions Data (All Time)</h3>
+        </div>
+        <div class="p-6 grid grid-cols-3 gap-4">
+            <?php
+            $s1t = (float)($emissions['Scope 1'] ?? 0);
+            $s2t = (float)($emissions['Scope 2 Location-Based'] ?? 0) + (float)($emissions['Scope 2 Market-Based'] ?? 0);
+            $tot = $s1t + $s2t;
+            ?>
+            <div class="text-center bg-green-50 rounded-lg p-4 border border-green-100">
+                <p class="text-xs text-green-600 font-medium">Scope 1</p>
+                <p class="text-xl font-bold text-green-700"><?= number_format($s1t, 4) ?></p>
+                <p class="text-xs text-green-500">tCO2e</p>
+            </div>
+            <div class="text-center bg-blue-50 rounded-lg p-4 border border-blue-100">
+                <p class="text-xs text-blue-600 font-medium">Scope 2</p>
+                <p class="text-xl font-bold text-blue-700"><?= number_format($s2t, 4) ?></p>
+                <p class="text-xs text-blue-500">tCO2e</p>
+            </div>
+            <div class="text-center bg-gray-50 rounded-lg p-4 border border-gray-200">
+                <p class="text-xs text-gray-600 font-medium">Total</p>
+                <p class="text-xl font-bold text-gray-700"><?= number_format($tot, 4) ?></p>
+                <p class="text-xs text-gray-500">tCO2e</p>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+</div>
+
+<?php require_once '../includes/footer.php'; ?>

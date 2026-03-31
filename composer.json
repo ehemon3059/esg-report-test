@@ -1,0 +1,12 @@
+{
+    "name": "esg/reporting-platform",
+    "description": "ESG Reporting Platform",
+    "type": "project",
+    "require": {
+        "php": ">=8.0",
+        "tecnickcom/tcpdf": "^6.6"
+    },
+    "config": {
+        "optimize-autoloader": true
+    }
+}
