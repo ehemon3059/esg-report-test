@@ -17,7 +17,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($email === '' || $password === '') {
         $error = 'Please enter your email and password.';
     } else {
-        $stmt = $pdo->prepare('SELECT id, company_id, name, email, password, role FROM users WHERE email = :email AND deleted_at IS NULL');
+        $stmt = $pdo->prepare('SELECT id, company_id, name, email, password, role FROM users WHERE email = :email');
         $stmt->execute([':email' => $email]);
         $user = $stmt->fetch();
 

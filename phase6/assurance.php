@@ -209,6 +209,10 @@ require_once '../includes/header.php';
                 <!-- Conclusion -->
                 <div>
                     <label class="block text-sm font-medium text-gray-700 mb-1">Assurance Conclusion</label>
+                    <p class="text-xs text-amber-600 mt-0.5 mb-1">
+                        Tip: Ensure your conclusion references the correct period end date
+                        (<?= date('d F Y', strtotime($selectedPeriod . '-01 last day of this month')) ?>).
+                    </p>
                     <textarea name="conclusion" rows="4"
                               class="w-full px-4 py-2.5 border border-gray-300 rounded-lg text-base focus:ring-2 focus:ring-emerald-500 outline-none resize-none"
                               placeholder="State the assurance provider's conclusion or opinion on the sustainability information..."><?= htmlspecialchars((string)$val('conclusion'), ENT_QUOTES, 'UTF-8') ?></textarea>

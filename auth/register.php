@@ -34,7 +34,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Check email uniqueness
     if (empty($errors)) {
-        $stmt = $pdo->prepare('SELECT id FROM users WHERE email = :email AND deleted_at IS NULL');
+        $stmt = $pdo->prepare('SELECT id FROM users WHERE email = :email');
         $stmt->execute([':email' => $email]);
         if ($stmt->fetch()) {
             $errors[] = 'This email address is already registered.';

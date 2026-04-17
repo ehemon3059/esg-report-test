@@ -75,8 +75,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             // Step 6: Insert emission record
             $stmt = $pdo->prepare('
-                INSERT INTO emission_records (id, company_id, scope, tco2e_calculated, energy_activity_id, emission_factor_id, date_calculated, created_at)
-                VALUES (:id, :company_id, \'Scope 2 Location-Based\', :tco2e, :energy_id, :ef_id, NOW(), NOW())
+                INSERT INTO emission_records (id, company_id, scope, tco2e_calculated, energy_activity_id, emission_factor_id, date_calculated)
+                VALUES (:id, :company_id, \'Scope 2 Location-Based\', :tco2e, :energy_id, :ef_id, NOW())
             ');
             $stmt->execute([
                 ':id'         => uuid(),
@@ -102,7 +102,7 @@ $stmt = $pdo->prepare('
     LEFT JOIN emission_records er ON er.energy_activity_id = ea.id
     LEFT JOIN emission_factors ef ON er.emission_factor_id = ef.id
     WHERE s.company_id = :company_id
-    ORDER BY ea.created_at DESC
+    ORDER BY ea.date DESC
     LIMIT 25
 ');
 $stmt->execute([':company_id' => company_id()]);

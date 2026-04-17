@@ -64,6 +64,40 @@ function fetchReport(PDO $db, string $table, string $cid, string $period) {
     return $s->fetch();
 }
 
+// Helper: label-value row for PDF
+function pdfRow(TCPDF $pdf, string $label, string $value, bool $multiline = false): void {
+    $pdf->SetFont('helvetica', 'B', 10);
+    $pdf->Cell(58, 6, $label . ':', 0, 0);
+    $pdf->SetFont('helvetica', '', 10);
+    if ($multiline) {
+        $pdf->MultiCell(0, 6, $value !== '' ? $value : '—', 0, 'L');
+    } else {
+        $pdf->Cell(0, 6, $value !== '' ? $value : '—', 0, 1);
+    }
+}
+
+// Helper: convert database enum values to readable labels
+function formatEnum(string $value): string {
+    $map = [
+        // DNSH Status
+        'ALL_OBJECTIVES_PASSED'    => 'All Objectives Passed',
+        'SOME_OBJECTIVES_NOT_MET'  => 'Some Objectives Not Met',
+        'ASSESSMENT_IN_PROGRESS'   => 'Assessment In Progress',
+        // Social Safeguards
+        'FULL_COMPLIANCE'          => 'Full Compliance',
+        'NON_COMPLIANCE'           => 'Non-Compliance',
+        'PARTIAL_REMEDIATION'      => 'Partial Remediation',
+        // Assurance Level
+        'limited'                  => 'Limited Assurance',
+        'reasonable'               => 'Reasonable Assurance',
+        // Status
+        'DRAFT'                    => 'Draft',
+        'APPROVED'                 => 'Approved',
+        'PUBLISHED'                => 'Published',
+    ];
+    return $map[$value] ?? ucwords(strtolower(str_replace('_', ' ', $value)));
+}
+
 // Generate PDF if requested
 if ($action === 'generate' && $period !== '') {
     if (!$tcpdfAvailable) {
@@ -84,6 +118,29 @@ if ($action === 'generate' && $period !== '') {
         $esrs2 = fetchReport($pdo, 'esrs2_general_disclosures', $cid, $period);
     } catch (PDOException $e) {
         // Table doesn't exist yet — skip
+    }
+
+    // Period date helpers — derive human-readable labels from YYYY-MM period string
+    $periodDate      = DateTime::createFromFormat('Y-m', $period);
+    $periodEndDate   = (clone $periodDate)->modify('last day of this month');
+    $periodLabel     = $periodEndDate->format('d F Y');    // e.g. "31 March 2026"
+    $periodYear      = $periodEndDate->format('Y');        // e.g. "2026"
+    $periodMonthYear = $periodDate->format('F Y');         // e.g. "March 2026"
+
+    // Scope 3 data (table may not exist yet)
+    $scope3Entries = [];
+    $scope3Total   = 0;
+    try {
+        $s3stmt = $pdo->prepare('
+            SELECT * FROM scope3_activities
+            WHERE company_id = :cid AND reporting_period = :p
+            ORDER BY category ASC
+        ');
+        $s3stmt->execute([':cid' => $cid, ':p' => $period]);
+        $scope3Entries = $s3stmt->fetchAll();
+        $scope3Total   = array_sum(array_column($scope3Entries, 'tco2e_estimated'));
+    } catch (PDOException $e) {
+        // Table doesn't exist yet — skip silently
     }
 
     // Init TCPDF
@@ -110,7 +167,7 @@ if ($action === 'generate' && $period !== '') {
     $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
     $pdf->Cell(0, 10, $company['name'] ?? '', 0, 1, 'C');
     $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
-    $pdf->Cell(0, 8, 'Reporting Period: ' . $period, 0, 1, 'C');
+    $pdf->Cell(0, 8, 'Reporting Period: ' . $periodMonthYear, 0, 1, 'C');
     $pdf->Cell(0, 8, 'Generated: ' . date('d F Y'), 0, 1, 'C');
     $pdf->Ln(10);
 
@@ -144,7 +201,183 @@ if ($action === 'generate' && $period !== '') {
     $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
     $pdf->Cell(0, 7, 'Total Emissions (Scope 1+2): ' . number_format($total, 4) . ' tCO2e', 0, 1);
     $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
-    $pdf->Ln(5);
+    $pdf->Cell(0, 7, 'Scope 3 (Value Chain, Estimated): ' .
+        (!empty($scope3Entries)
+            ? number_format($scope3Total, 4) . ' tCO2e (' . count($scope3Entries) . ' categories)'
+            : 'Not reported this period'),
+        0, 1);
+    $pdf->Ln(3);
+    $pdf->Cell(0, 6, 'Calculation method: GHG Protocol Corporate Standard, DEFRA 2024 emission factors.', 0, 1);
+    $pdf->Ln(4);
+
+    // Fuel activities breakdown table
+    $stmt = $pdo->prepare('
+        SELECT fa.date, s.name AS site_name, fa.fuel_type, fa.volume, fa.unit,
+               er.tco2e_calculated, ef.source
+        FROM fuel_activities fa
+        JOIN sites s ON fa.site_id = s.id
+        LEFT JOIN emission_records er ON er.fuel_activity_id = fa.id
+        LEFT JOIN emission_factors ef ON er.emission_factor_id = ef.id
+        WHERE s.company_id = :cid
+        ORDER BY fa.date DESC
+        LIMIT 20
+    ');
+    $stmt->execute([':cid' => $cid]);
+    $fuelRows = $stmt->fetchAll();
+
+    $energyStmt = $pdo->prepare('
+        SELECT ea.date, s.name AS site_name, ea.energy_type, ea.consumption, ea.unit,
+               er.tco2e_calculated, ef.region AS ef_region
+        FROM energy_activities ea
+        JOIN sites s ON ea.site_id = s.id
+        LEFT JOIN emission_records er ON er.energy_activity_id = ea.id
+        LEFT JOIN emission_factors ef ON er.emission_factor_id = ef.id
+        WHERE s.company_id = :cid
+        ORDER BY ea.date DESC
+        LIMIT 20
+    ');
+    $energyStmt->execute([':cid' => $cid]);
+    $energyRows = $energyStmt->fetchAll();
+
+    if (!empty($fuelRows)) {
+        $pdf->SetFont('helvetica', 'B', 10);
+        $pdf->Cell(0, 6, 'Scope 1 — Fuel Activities Detail:', 0, 1);
+        $pdf->Ln(1);
+        $pdf->SetFillColor(5, 78, 59);
+        $pdf->SetTextColor(255, 255, 255);
+        $pdf->SetFont('helvetica', 'B', 8);
+        $pdf->Cell(22, 6, 'Date',      1, 0, 'C', true);
+        $pdf->Cell(38, 6, 'Site',      1, 0, 'C', true);
+        $pdf->Cell(30, 6, 'Fuel Type', 1, 0, 'C', true);
+        $pdf->Cell(22, 6, 'Volume',    1, 0, 'C', true);
+        $pdf->Cell(14, 6, 'Unit',      1, 0, 'C', true);
+        $pdf->Cell(26, 6, 'tCO2e',     1, 0, 'C', true);
+        $pdf->Cell(18, 6, 'Source',    1, 1, 'C', true);
+        $pdf->SetTextColor(0, 0, 0);
+        $pdf->SetFont('helvetica', '', 8);
+        foreach ($fuelRows as $i => $r) {
+            $bg = ($i % 2 === 0);
+            $pdf->SetFillColor(245, 250, 247);
+            $pdf->Cell(22, 5, $r['date'],                                          1, 0, 'C', $bg);
+            $pdf->Cell(38, 5, $r['site_name'],                                     1, 0, 'L', $bg);
+            $pdf->Cell(30, 5, ucwords(str_replace('_', ' ', $r['fuel_type'])),     1, 0, 'L', $bg);
+            $pdf->Cell(22, 5, number_format((float)$r['volume'], 2),               1, 0, 'R', $bg);
+            $pdf->Cell(14, 5, $r['unit'],                                          1, 0, 'C', $bg);
+            $pdf->Cell(26, 5, $r['tco2e_calculated'] !== null
+                              ? number_format((float)$r['tco2e_calculated'], 4)
+                              : '—',                                               1, 0, 'R', $bg);
+            $pdf->Cell(18, 5, $r['source'] ?? '—',                                1, 1, 'C', $bg);
+        }
+        $pdf->Ln(4);
+    }
+
+    if (!empty($energyRows)) {
+        $pdf->SetFont('helvetica', 'B', 10);
+        $pdf->Cell(0, 6, 'Scope 2 — Energy Activities Detail:', 0, 1);
+        $pdf->Ln(1);
+        $pdf->SetFillColor(24, 95, 165);
+        $pdf->SetTextColor(255, 255, 255);
+        $pdf->SetFont('helvetica', 'B', 8);
+        $pdf->Cell(22, 6, 'Date',        1, 0, 'C', true);
+        $pdf->Cell(38, 6, 'Site',        1, 0, 'C', true);
+        $pdf->Cell(35, 6, 'Energy Type', 1, 0, 'C', true);
+        $pdf->Cell(22, 6, 'Consumption', 1, 0, 'C', true);
+        $pdf->Cell(14, 6, 'Unit',        1, 0, 'C', true);
+        $pdf->Cell(26, 6, 'tCO2e',       1, 0, 'C', true);
+        $pdf->Cell(13, 6, 'Region',      1, 1, 'C', true);
+        $pdf->SetTextColor(0, 0, 0);
+        $pdf->SetFont('helvetica', '', 8);
+        foreach ($energyRows as $i => $r) {
+            $bg = ($i % 2 === 0);
+            $pdf->SetFillColor(235, 245, 255);
+            $pdf->Cell(22, 5, date('Y-m', strtotime($r['date'])),                      1, 0, 'C', $bg);
+            $pdf->Cell(38, 5, $r['site_name'],                                         1, 0, 'L', $bg);
+            $pdf->Cell(35, 5, ucwords(str_replace('_', ' ', $r['energy_type'])),       1, 0, 'L', $bg);
+            $pdf->Cell(22, 5, number_format((float)$r['consumption'], 2),              1, 0, 'R', $bg);
+            $pdf->Cell(14, 5, $r['unit'],                                              1, 0, 'C', $bg);
+            $pdf->Cell(26, 5, $r['tco2e_calculated'] !== null
+                              ? number_format((float)$r['tco2e_calculated'], 4)
+                              : '—',                                                   1, 0, 'R', $bg);
+            $pdf->Cell(13, 5, $r['ef_region'] ?? '—',                                 1, 1, 'C', $bg);
+        }
+        $pdf->Ln(4);
+    }
+
+    // ========== SECTION 2B: SCOPE 3 VALUE CHAIN ==========
+    if (!empty($scope3Entries)) {
+        $pdf->AddPage();
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_H2);
+        $pdf->SetFillColor(88, 28, 135);
+        $pdf->SetTextColor(255, 255, 255);
+        $pdf->Cell(0, 10, '2B. Scope 3 — Value Chain Emissions', 0, 1, 'L', true);
+        $pdf->SetTextColor(0, 0, 0);
+        $pdf->Ln(2);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        $pdf->MultiCell(0, 7,
+            'The following Scope 3 categories were assessed for the reporting period ' . $periodMonthYear . '. ' .
+            'Scope 3 covers all indirect emissions in the upstream and downstream value chain, ' .
+            'in accordance with the GHG Protocol Corporate Value Chain (Scope 3) Standard.',
+            0, 'L');
+        $pdf->Ln(3);
+
+        $s3cats = [
+            'Cat 1'  => 'Purchased Goods & Services',
+            'Cat 2'  => 'Capital Goods',
+            'Cat 3'  => 'Fuel & Energy Related Activities',
+            'Cat 4'  => 'Upstream Transportation & Distribution',
+            'Cat 5'  => 'Waste Generated in Operations',
+            'Cat 6'  => 'Business Travel',
+            'Cat 7'  => 'Employee Commuting',
+            'Cat 8'  => 'Upstream Leased Assets',
+            'Cat 9'  => 'Downstream Transportation',
+            'Cat 10' => 'Processing of Sold Products',
+            'Cat 11' => 'Use of Sold Products',
+            'Cat 12' => 'End-of-Life Treatment of Sold Products',
+            'Cat 13' => 'Downstream Leased Assets',
+            'Cat 14' => 'Franchises',
+            'Cat 15' => 'Investments',
+        ];
+
+        // Table header
+        $pdf->SetFillColor(88, 28, 135);
+        $pdf->SetTextColor(255, 255, 255);
+        $pdf->SetFont('helvetica', 'B', 8);
+        $pdf->Cell(22, 6, 'Category',    1, 0, 'C', true);
+        $pdf->Cell(70, 6, 'Description', 1, 0, 'C', true);
+        $pdf->Cell(40, 6, 'Method',      1, 0, 'C', true);
+        $pdf->Cell(22, 6, 'Quality',     1, 0, 'C', true);
+        $pdf->Cell(16, 6, 'tCO2e',       1, 1, 'C', true);
+        $pdf->SetTextColor(0, 0, 0);
+        $pdf->SetFont('helvetica', '', 8);
+
+        foreach ($scope3Entries as $i => $e) {
+            $bg = ($i % 2 === 0);
+            $pdf->SetFillColor(245, 240, 255);
+            $pdf->Cell(22, 5, $e['category'],                                      1, 0, 'C', $bg);
+            $pdf->Cell(70, 5, substr($e['description'] ?? '—', 0, 65),            1, 0, 'L', $bg);
+            $pdf->Cell(40, 5, substr($e['estimation_method'] ?? '—', 0, 35),      1, 0, 'L', $bg);
+            $pdf->Cell(22, 5, ucfirst($e['data_quality']),                         1, 0, 'C', $bg);
+            $pdf->Cell(16, 5, $e['tco2e_estimated'] !== null
+                              ? number_format((float)$e['tco2e_estimated'], 2) : '—',
+                              1, 1, 'R', $bg);
+        }
+        // Total row
+        $pdf->SetFillColor(220, 200, 255);
+        $pdf->SetFont('helvetica', 'B', 8);
+        $pdf->Cell(154, 6, 'Total Scope 3 Estimated Emissions', 1, 0, 'R', true);
+        $pdf->Cell(16,  6, number_format($scope3Total, 2), 1, 1, 'R', true);
+        $pdf->Ln(3);
+
+        $pdf->SetFont('helvetica', 'I', 9);
+        $pdf->SetTextColor(100, 100, 100);
+        $pdf->MultiCell(0, 5,
+            'Note: Scope 3 figures are estimates based on available activity data and spend-based ' .
+            'calculations. These have not been subject to third-party verification unless explicitly ' .
+            'stated in the assurance section.',
+            0, 'L');
+        $pdf->SetTextColor(0, 0, 0);
+        $pdf->Ln(5);
+    }
 
     // ========== SECTION 3: ESRS 2 ==========
     if ($esrs2) {
@@ -200,16 +433,38 @@ if ($action === 'generate' && $period !== '') {
             $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
             $pdf->Cell(0, 7, 'Water Withdrawal: ' . ($env['e3_water_withdrawal_m3'] ?? 'N/A') . ' m³ | Recycling Rate: ' . ($env['e3_water_recycling_rate_pct'] ?? 'N/A') . '%', 0, 1);
         }
-        if ($env['e4_material'] && !empty($env['e4_protected_areas_impact'])) {
-            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
-            $pdf->Cell(0, 7, 'E4 - Biodiversity:', 0, 1);
-            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
-            $pdf->MultiCell(0, 7, $env['e4_protected_areas_impact'], 0, 'L');
+        // E4 — always show
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+        $pdf->Cell(0, 7, 'E4 — Biodiversity & Ecosystems:', 0, 1);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        if (!$env['e4_material']) {
+            $pdf->SetTextColor(150, 150, 150);
+            $pdf->MultiCell(0, 5,
+                'Not identified as a material topic for this reporting period, based on the outcome ' .
+                'of a Double Materiality Assessment conducted in accordance with ESRS 1 requirements. ' .
+                'The assessment evaluated both financial materiality (impact on company value) and ' .
+                'impact materiality (the company\'s effects on people and environment).',
+                0, 'L');
+            $pdf->SetTextColor(0, 0, 0);
+        } else {
+            $pdf->MultiCell(0, 7, $env['e4_protected_areas_impact'] ?? '', 0, 'L');
         }
-        if ($env['e5_material']) {
-            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
-            $pdf->Cell(0, 7, 'E5 - Circular Economy:', 0, 1);
-            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        $pdf->Ln(2);
+
+        // E5 — always show
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+        $pdf->Cell(0, 7, 'E5 — Resource Use & Circular Economy:', 0, 1);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        if (!$env['e5_material']) {
+            $pdf->SetTextColor(150, 150, 150);
+            $pdf->MultiCell(0, 5,
+                'Not identified as a material topic for this reporting period, based on the outcome ' .
+                'of a Double Materiality Assessment conducted in accordance with ESRS 1 requirements. ' .
+                'The assessment evaluated both financial materiality (impact on company value) and ' .
+                'impact materiality (the company\'s effects on people and environment).',
+                0, 'L');
+            $pdf->SetTextColor(0, 0, 0);
+        } else {
             $pdf->Cell(0, 7, 'Recycling Rate: ' . ($env['e5_recycling_rate_pct'] ?? 'N/A') . '% | Recycled Inputs: ' . ($env['e5_recycled_input_materials_pct'] ?? 'N/A') . '%', 0, 1);
         }
         $pdf->Ln(5);
@@ -237,11 +492,24 @@ if ($action === 'generate' && $period !== '') {
             $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
             $pdf->Cell(0, 7, 'Suppliers Audited: ' . ($social['s2_pct_suppliers_audited'] ?? 'N/A') . '%', 0, 1);
         }
-        if ($social['s3_material'] && !empty($social['s3_community_engagement'])) {
-            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
-            $pdf->Cell(0, 7, 'S3 - Communities:', 0, 1);
-            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
-            $pdf->MultiCell(0, 7, $social['s3_community_engagement'], 0, 'L');
+        // S3 — always show
+        $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+        $pdf->Cell(0, 7, 'S3 — Affected Communities:', 0, 1);
+        $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+        if (!$social['s3_material']) {
+            $pdf->SetTextColor(150, 150, 150);
+            $pdf->MultiCell(0, 5,
+                'Not identified as a material topic for this reporting period, based on the outcome ' .
+                'of a Double Materiality Assessment conducted in accordance with ESRS 1 requirements. ' .
+                'The assessment evaluated both financial materiality (impact on company value) and ' .
+                'impact materiality (the company\'s effects on people and environment).',
+                0, 'L');
+            $pdf->SetTextColor(0, 0, 0);
+        } else {
+            $pdf->MultiCell(0, 7, $social['s3_community_engagement'] ?? '', 0, 'L');
+            if (!empty($social['s3_complaints_and_outcomes'])) {
+                $pdf->MultiCell(0, 7, 'Complaints & Outcomes: ' . $social['s3_complaints_and_outcomes'], 0, 'L');
+            }
         }
         if ($social['s4_material']) {
             $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
@@ -263,7 +531,16 @@ if ($action === 'generate' && $period !== '') {
             $pdf->MultiCell(0, 7, 'ESG Oversight: ' . $gov['g1_esg_oversight'], 0, 'L');
         }
         if (!empty($gov['g1_anti_corruption_policies'])) {
-            $pdf->Cell(0, 7, 'Anti-Corruption Policies: ' . $gov['g1_anti_corruption_policies'], 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Anti-Corruption Policy:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $gov['g1_anti_corruption_policies'], 0, 'L');
+        }
+        if (!empty($gov['g1_related_party_controls'])) {
+            $pdf->SetFont(PDF_FONT_FAMILY, 'B', PDF_FONT_BODY);
+            $pdf->Cell(0, 7, 'Related-Party Controls:', 0, 1);
+            $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
+            $pdf->MultiCell(0, 7, $gov['g1_related_party_controls'], 0, 'L');
         }
         if (!empty($gov['g1_board_composition_independence'])) {
             $pdf->MultiCell(0, 7, 'Board Composition: ' . $gov['g1_board_composition_independence'], 0, 'L');
@@ -280,8 +557,8 @@ if ($action === 'generate' && $period !== '') {
         $pdf->Cell(0, 7, 'Eligible Revenue: ' . ($tax['taxonomy_eligible_revenue_pct'] ?? 'N/A') . '%  |  Aligned Revenue: ' . ($tax['taxonomy_aligned_revenue_pct'] ?? 'N/A') . '%', 0, 1);
         $pdf->Cell(0, 7, 'Eligible CapEx: ' . ($tax['taxonomy_eligible_capex_pct'] ?? 'N/A') . '%  |  Aligned CapEx: ' . ($tax['taxonomy_aligned_capex_pct'] ?? 'N/A') . '%', 0, 1);
         $pdf->Cell(0, 7, 'Aligned OpEx: ' . ($tax['taxonomy_aligned_opex_pct'] ?? 'N/A') . '%', 0, 1);
-        $pdf->Cell(0, 7, 'DNSH Status: ' . ($tax['dnsh_status'] ?? 'N/A'), 0, 1);
-        $pdf->Cell(0, 7, 'Social Safeguards: ' . ($tax['social_safeguards_status'] ?? 'N/A'), 0, 1);
+        $pdf->Cell(0, 7, 'DNSH Status: ' . formatEnum($tax['dnsh_status'] ?? ''), 0, 1);
+        $pdf->Cell(0, 7, 'Social Safeguards: ' . formatEnum($tax['social_safeguards_status'] ?? ''), 0, 1);
         $pdf->Ln(5);
     }
 
@@ -292,7 +569,7 @@ if ($action === 'generate' && $period !== '') {
         $pdf->Ln(2);
         $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
         $pdf->Cell(0, 7, 'Provider: ' . ($assurance['provider'] ?? 'N/A'), 0, 1);
-        $pdf->Cell(0, 7, 'Level: ' . ucfirst($assurance['level'] ?? 'N/A') . ' Assurance', 0, 1);
+        $pdf->Cell(0, 7, 'Level: ' . formatEnum($assurance['level'] ?? ''), 0, 1);
         $pdf->Cell(0, 7, 'Standard: ' . ($assurance['standard'] ?? 'N/A'), 0, 1);
         if (!empty($assurance['report_date'])) {
             $pdf->Cell(0, 7, 'Report Date: ' . date('d F Y', strtotime($assurance['report_date'])), 0, 1);
@@ -302,6 +579,11 @@ if ($action === 'generate' && $period !== '') {
             $pdf->Cell(0, 7, 'Conclusion:', 0, 1);
             $pdf->SetFont(PDF_FONT_FAMILY, '', PDF_FONT_BODY);
             $pdf->MultiCell(0, 7, $assurance['conclusion'], 0, 'L');
+            $pdf->Ln(2);
+            $pdf->SetFont('helvetica', 'I', 9);
+            $pdf->SetTextColor(100, 100, 100);
+            $pdf->Cell(0, 5, 'Period covered by this assurance engagement ends: ' . $periodLabel, 0, 1);
+            $pdf->SetTextColor(0, 0, 0);
         }
         $pdf->Ln(5);
     }
@@ -309,7 +591,7 @@ if ($action === 'generate' && $period !== '') {
     // ========== FOOTER ==========
     $pdf->SetFont(PDF_FONT_FAMILY, 'I', PDF_FONT_SMALL);
     $pdf->Cell(0, 7, 'This report was generated by the ESG Reporting Platform on ' . date('d F Y H:i') . ' UTC', 0, 1, 'C');
-    $pdf->Cell(0, 7, 'Reporting Period: ' . $period . ' | Company ID: ' . $cid, 0, 1, 'C');
+    $pdf->Cell(0, 7, 'Reporting Period: ' . $periodMonthYear . ' | Company ID: ' . $cid, 0, 1, 'C');
 
     $filename = 'ESG_Report_' . preg_replace('/[^A-Za-z0-9_-]/', '_', $company['name'] ?? 'Company') . '_' . $period . '.pdf';
     $pdf->Output($filename, 'D');
